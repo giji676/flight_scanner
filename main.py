@@ -21,10 +21,22 @@ URL = "https://www.skyscanner.net/transport/flights/lond/tbs?adultsv2=1&cabincla
 
 # === EMAIL NOTIFICATION ===
 def send_email_notification(price_changes):
-    subject = f"{len(price_changes)} New Low Price(s) Found!"
+    total_changes = len(price_changes['outbound']) + len(price_changes['inbound'])
+    subject = f"{total_changes} Price Change(s) Detected!"
     lines = []
-    for date, new_price, old_price in price_changes:
-        lines.append(f"{date}: £{new_price} (was £{old_price if old_price is not None else 'N/A'})")
+
+    if price_changes["outbound"]:
+        lines.append("Outbound calendar:")
+        for date, new_price, old_price in price_changes["outbound"]:
+            direction = "⬆️ UP" if new_price > (old_price if old_price is not None else 0) else "⬇️ DOWN"
+            lines.append(f"  {date}: £{new_price} (was £{old_price if old_price is not None else 'N/A'}) [{direction}]")
+
+    if price_changes["inbound"]:
+        lines.append("\nInbound calendar:")
+        for date, new_price, old_price in price_changes["inbound"]:
+            direction = "⬆️ UP" if new_price > (old_price if old_price is not None else 0) else "⬇️ DOWN"
+            lines.append(f"  {date}: £{new_price} (was £{old_price if old_price is not None else 'N/A'}) [{direction}]")
+
     body = "\n".join(lines) + f"\n\nView on Skyscanner:\n{URL}"
 
     msg = EmailMessage()
@@ -46,7 +58,8 @@ def load_local_prices():
     if os.path.exists(DATA_FILE):
         with open(DATA_FILE, "r") as f:
             return json.load(f)
-    return {}
+    # initialize dict if no file
+    return {"outbound": {}, "inbound": {}}
 
 def save_local_prices(prices):
     with open(DATA_FILE, "w") as f:
@@ -65,12 +78,11 @@ def accept_cookies(driver):
 
 def check_direct_flights_checkbox(driver):
     try:
-        # Wait for the checkbox to be present and clickable
-        checkbox = WebDriverWait(driver, 10).until(
+        checkbox = WebDriverWait(driver, 15).until(
             EC.element_to_be_clickable((By.CSS_SELECTOR, "input.BpkCheckbox_bpk-checkbox__input__M2ZjN[data-testid='prefer-directs']"))
         )
         driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", checkbox)
-        time.sleep(0.5)  # Small delay to ensure visibility
+        time.sleep(0.5)
 
         if not checkbox.is_selected():
             checkbox.click()
@@ -81,17 +93,17 @@ def check_direct_flights_checkbox(driver):
         print("Failed to check 'Direct flights' checkbox:", e)
 
 # === PRICE SCRAPER ===
-def scrape_prices(driver):
+def scrape_calendar_prices(calendar_element):
     prices = {}
     try:
-        WebDriverWait(driver, 60).until(
+        WebDriverWait(calendar_element, 30).until(
             EC.presence_of_element_located((By.CSS_SELECTOR, "div.BpkCalendarWeek_bpk-calendar-week__MGQ2N"))
         )
     except TimeoutException:
-        print("Timed out waiting for calendar to load.")
+        print("Timed out waiting for calendar weeks to load.")
         return prices
 
-    week_rows = driver.find_elements(By.CSS_SELECTOR, "div.BpkCalendarWeek_bpk-calendar-week__MGQ2N")
+    week_rows = calendar_element.find_elements(By.CSS_SELECTOR, "div.BpkCalendarWeek_bpk-calendar-week__MGQ2N")
 
     for week in week_rows:
         day_buttons = week.find_elements(By.CSS_SELECTOR, "button.month-view-calendar__cell")
@@ -106,21 +118,46 @@ def scrape_prices(driver):
             if date:
                 parts = date.split(",")
                 if len(parts) > 1:
-                    date_clean = parts[1].strip()  # "01 July 2025"
+                    date_clean = parts[1].strip()  # e.g. "01 July 2025"
                 else:
                     date_clean = date.strip()
                 prices[date_clean] = price
 
     return prices
 
+def scrape_prices(driver):
+    prices = {"outbound": {}, "inbound": {}}
+
+    try:
+        outbound_calendar = WebDriverWait(driver, 30).until(
+            EC.presence_of_element_located((By.CSS_SELECTOR, "div.month-view-calendar.outbound-calendar"))
+        )
+        inbound_calendar = WebDriverWait(driver, 30).until(
+            EC.presence_of_element_located((By.CSS_SELECTOR, "div.month-view-calendar.inbound-calendar"))
+        )
+    except TimeoutException:
+        print("Timed out waiting for calendars to load.")
+        return prices
+
+    prices["outbound"] = scrape_calendar_prices(outbound_calendar)
+    prices["inbound"] = scrape_calendar_prices(inbound_calendar)
+
+    return prices
+
 # === MAIN LOOP ===
 def main():
     lowest_prices = load_local_prices()
+    # Ensure keys exist
+    if "outbound" not in lowest_prices:
+        lowest_prices["outbound"] = {}
+    if "inbound" not in lowest_prices:
+        lowest_prices["inbound"] = {}
+
     print("Loaded previous lowest prices from disk.")
 
     options = uc.ChromeOptions()
     options.add_argument("--window-size=1920,1080")
-    # options.add_argument("--headless")  # Uncomment if you want headless mode
+    # options.add_argument("--headless")  # Uncomment if needed
 
     driver = uc.Chrome(options=options)
     driver.get(URL)
@@ -132,18 +169,34 @@ def main():
         check_direct_flights_checkbox(driver)
         current_prices = scrape_prices(driver)
 
-        new_low_prices = []
+        price_changes = {"outbound": [], "inbound": []}
 
-        for date, price in current_prices.items():
+        # Outbound comparison
+        for date, price in current_prices["outbound"].items():
             if price is not None:
-                old_price = lowest_prices.get(date)
-                if old_price is None or price < old_price:
-                    print(f"[NEW LOW] {date}: £{price} (was £{old_price})")
-                    new_low_prices.append((date, price, old_price))
-                    lowest_prices[date] = price
+                old_price = lowest_prices["outbound"].get(date)
+                if old_price is None:
+                    # New date seen, treat as a change
+                    price_changes["outbound"].append((date, price, old_price))
+                    lowest_prices["outbound"][date] = price
+                elif price != old_price:
+                    # Price changed (up or down)
+                    price_changes["outbound"].append((date, price, old_price))
+                    lowest_prices["outbound"][date] = price
 
-        if new_low_prices:
-            send_email_notification(new_low_prices)
+        # Inbound comparison
+        for date, price in current_prices["inbound"].items():
+            if price is not None:
+                old_price = lowest_prices["inbound"].get(date)
+                if old_price is None:
+                    price_changes["inbound"].append((date, price, old_price))
+                    lowest_prices["inbound"][date] = price
+                elif price != old_price:
+                    price_changes["inbound"].append((date, price, old_price))
+                    lowest_prices["inbound"][date] = price
+
+        if price_changes["outbound"] or price_changes["inbound"]:
+            send_email_notification(price_changes)
             save_local_prices(lowest_prices)
             print("Saved updated prices to disk.")
 
